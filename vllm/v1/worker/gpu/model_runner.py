@@ -37,6 +37,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.lora.layers import LoRAMapping
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -244,6 +245,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+
+        # Async graph replay thread for ROCm (hipGraphLaunch workaround).
+        import os as _os
+        from vllm.v1.worker.gpu_model_runner import GraphReplayThread
+        self._replay_thread: GraphReplayThread | None = None
+        if (
+            current_platform.is_rocm()
+            and not self.model_config.enforce_eager
+            and not _os.environ.get("VLLM_DISABLE_ASYNC_GRAPH_REPLAY")
+        ):
+            self._replay_thread = GraphReplayThread(self.device)
+            logger.info(
+                "Async graph replay enabled (ROCm hipGraphLaunch workaround)"
+            )
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -1153,71 +1168,85 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             del intermediate_tensors
 
-        # Run model.
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            # Use explicit cudagraph replay for FULL mode.
-            # NOTE(woosuk): Here, we don't need to pass the input tensors,
-            # because they are already copied to the CUDA graph input buffers.
-            assert self.cudagraph_manager is not None
-            self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
-        else:
-            # For piecewise and eager mode, just call model().
-            batch_descriptor = BatchDescriptor(
-                num_tokens=input_batch.num_tokens_after_padding,
-                has_lora=self.lora_config is not None,
+        # Package the forward + postprocess into a callable for potential
+        # async execution on the replay thread (ROCm hipGraphLaunch workaround).
+        def _run_forward_block():
+            if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                assert self.cudagraph_manager is not None
+                self.kv_connector.pre_forward(scheduler_output)
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            else:
+                batch_descriptor = BatchDescriptor(
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    has_lora=self.lora_config is not None,
+                )
+                with set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    cudagraph_runtime_mode=batch_desc.cg_mode,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    batch_descriptor=batch_descriptor,
+                    slot_mapping=slot_mappings_by_layer,
+                    skip_compiled=skip_compiled,
+                ):
+                    self.kv_connector.pre_forward(scheduler_output)
+                    model_output = self.model(**model_inputs)
+
+            if self.is_last_pp_rank:
+                if self.use_aux_hidden_state_outputs:
+                    assert isinstance(model_output, tuple)
+                    hidden_states, aux_hidden_states = model_output
+                else:
+                    assert isinstance(model_output, torch.Tensor)
+                    hidden_states = model_output
+                    aux_hidden_states = None
+                output_intermediate_tensors = None
+            else:
+                assert isinstance(model_output, IntermediateTensors)
+                hidden_states = None
+                aux_hidden_states = None
+                output_intermediate_tensors = model_output
+
+            kv_connector_output = self.kv_connector.post_forward(
+                scheduler_output)
+            self.execute_model_state = ExecuteModelState(
+                input_batch=input_batch,
+                attn_metadata=attn_metadata,
+                slot_mappings_by_layer=slot_mappings_by_layer,
+                hidden_states=hidden_states,
+                aux_hidden_states=aux_hidden_states,
+                kv_connector_output=kv_connector_output,
             )
 
-            with set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch.num_tokens_after_padding,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
-                num_tokens_across_dp=num_tokens_across_dp,
-                batch_descriptor=batch_descriptor,
-                slot_mapping=slot_mappings_by_layer,
-                skip_compiled=skip_compiled,
-            ):
-                self.kv_connector.pre_forward(scheduler_output)
-                model_output = self.model(**model_inputs)
+            if not self.is_last_pp_rank:
+                assert output_intermediate_tensors is not None
+                output_intermediate_tensors.kv_connector_output = \
+                    kv_connector_output
+                return output_intermediate_tensors
+            return None
 
-        if self.is_last_pp_rank:
-            if self.use_aux_hidden_state_outputs:
-                assert isinstance(model_output, tuple)
-                hidden_states, aux_hidden_states = model_output
-            else:
-                assert isinstance(model_output, torch.Tensor)
-                hidden_states = model_output
-                aux_hidden_states = None
-            output_intermediate_tensors = None
-        else:
-            assert isinstance(model_output, IntermediateTensors)
-            hidden_states = None
-            aux_hidden_states = None
-            output_intermediate_tensors = model_output
-
-        kv_connector_output = self.kv_connector.post_forward(scheduler_output)
-        self.execute_model_state = ExecuteModelState(
-            input_batch=input_batch,
-            attn_metadata=attn_metadata,
-            slot_mappings_by_layer=slot_mappings_by_layer,
-            hidden_states=hidden_states,
-            aux_hidden_states=aux_hidden_states,
-            kv_connector_output=kv_connector_output,
+        _use_async_replay = (
+            self._replay_thread is not None
+            and self.is_last_pp_rank
+            and not self.is_pooling_model
         )
-
-        if not self.is_last_pp_rank:
-            # Non-last PP rank: return IntermediateTensors for sending.
-            assert output_intermediate_tensors is not None
-            output_intermediate_tensors.kv_connector_output = kv_connector_output
-            return output_intermediate_tensors
-        return None
+        if _use_async_replay:
+            self._replay_thread.submit_forward(_run_forward_block)
+            return None
+        else:
+            return _run_forward_block()
 
     @torch.inference_mode()
     @step_eplb_after()
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> AsyncOutput | ModelRunnerOutput | None:
+        # When async graph replay is active, wait for the background thread
+        # to finish populating self.execute_model_state.
+        if self._replay_thread is not None:
+            self._replay_thread.wait_for_result()
+
         if self.execute_model_state is None:
             # The prior execute_model call must have failed.
             return None

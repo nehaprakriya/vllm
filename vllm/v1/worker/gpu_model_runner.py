@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -221,11 +222,55 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
+    from concurrent.futures import Future
+
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+class GraphReplayThread:
+    """Runs graph forward passes on a dedicated background thread so that
+    hipGraphLaunch blocking (ROCm) does not stall the worker's main thread.
+
+    On AMD ROCm, hipGraphLaunch blocks the calling CPU thread for the full
+    GPU execution duration.  By offloading the forward pass to this thread
+    the main thread is free to overlap CPU scheduling work (deferred state
+    corrections, next-batch input prep) with GPU execution.
+
+    Uses a single-worker ThreadPoolExecutor -- same pattern as the existing
+    async_output_thread in uniproc_executor.py.
+    """
+
+    def __init__(self, device: torch.device):
+        from concurrent.futures import Future, ThreadPoolExecutor
+
+        self._device = device
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="graph-replay")
+        self._executor.submit(self._init_thread).result()
+        self._pending: Future | None = None
+
+    def _init_thread(self):
+        """Set the CUDA device context on the replay thread."""
+        torch.cuda.set_device(self._device)
+
+    def submit_forward(self, fn) -> None:
+        """Submit *fn* (a zero-arg callable) to the replay thread."""
+        assert self._pending is None or self._pending.done(), \
+            "Previous forward pass has not completed"
+        self._pending = self._executor.submit(
+            torch.inference_mode()(fn))
+
+    def wait_for_result(self):
+        """Block until the submitted forward completes and return its value."""
+        if self._pending is not None:
+            result = self._pending.result()
+            self._pending = None
+            return result
+        return None
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -686,6 +731,20 @@ class GPUModelRunner(
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
             self.prepare_inputs_event = torch.Event()
+
+        # Async graph replay thread for ROCm.  hipGraphLaunch blocks the
+        # calling CPU thread for the full GPU execution duration; offloading
+        # the forward pass to a background thread lets the main thread
+        # overlap scheduling/input-prep with GPU execution.
+        self._replay_thread: GraphReplayThread | None = None
+        if (
+            current_platform.is_rocm()
+            and not model_config.enforce_eager
+            and not os.environ.get("VLLM_DISABLE_ASYNC_GRAPH_REPLAY")
+        ):
+            self._replay_thread = GraphReplayThread(self.device)
+            logger.info(
+                "Async graph replay enabled (ROCm hipGraphLaunch workaround)")
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
@@ -4207,116 +4266,149 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
-        with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
-            ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
-            ) as kv_connector_output,
-        ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
 
-        with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
-            else:
-                # Common case.
-                hidden_states = model_output
-                aux_hidden_states = None
-
-            if not self.broadcast_pp_output:
-                # Common case.
-                if not get_pp_group().is_last_rank:
-                    # Return the intermediate tensors.
-                    assert isinstance(hidden_states, IntermediateTensors)
-                    hidden_states.kv_connector_output = kv_connector_output
-                    self.kv_connector_output = kv_connector_output
-                    return hidden_states
-
-                if self.is_pooling_model:
-                    # Return the pooling output.
-                    return self._pool(
-                        hidden_states,
-                        num_scheduled_tokens,
-                        num_scheduled_tokens_np,
-                        kv_connector_output,
-                    )
-
-                sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
-            else:
-                # Rare case.
-                assert not self.is_pooling_model
-
-                sample_hidden_states = hidden_states[logits_indices]
-                if not get_pp_group().is_last_rank:
-                    all_gather_tensors = {
-                        "residual": not is_residual_scattered_for_sp(
-                            self.vllm_config, num_tokens_padded
-                        )
-                    }
-                    get_pp_group().send_tensor_dict(
-                        hidden_states.tensors,
-                        all_gather_group=get_tp_group(),
-                        all_gather_tensors=all_gather_tensors,
-                    )
-                    logits = None
-                else:
-                    logits = self.model.compute_logits(sample_hidden_states)
-
-                model_output_broadcast_data: dict[str, Any] = {}
-                if logits is not None:
-                    model_output_broadcast_data["logits"] = logits.contiguous()
-
-                broadcasted = get_pp_group().broadcast_tensor_dict(
-                    model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
+        # Package the forward pass + postprocessing into a callable so it
+        # can either run synchronously or be submitted to the async replay
+        # thread (ROCm hipGraphLaunch workaround).  All captured locals
+        # come from the input-prep section above.
+        def _run_forward_block():
+            with (
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,
+                    skip_compiled=has_encoder_input,
+                ),
+                record_function_or_nullcontext("gpu_model_runner: forward"),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    defer_finalize=defer_kv_connector_finalize,
+                ) as kv_connector_output,
+            ):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
                 )
-                assert broadcasted is not None
-                logits = broadcasted["logits"]
 
-        self.execute_model_state = ExecuteModelState(
-            scheduler_output,
-            logits,
-            spec_decode_metadata,
-            spec_decode_common_attn_metadata,
-            hidden_states,
-            sample_hidden_states,
-            aux_hidden_states,
-            ec_connector_output,
-            cudagraph_stats,
-            slot_mappings,
+            with record_function_or_nullcontext(
+                    "gpu_model_runner: postprocess"):
+                if self.use_aux_hidden_state_outputs:
+                    hidden_states, aux_hidden_states = model_output
+                else:
+                    hidden_states = model_output
+                    aux_hidden_states = None
+
+                if not self.broadcast_pp_output:
+                    if not get_pp_group().is_last_rank:
+                        assert isinstance(hidden_states, IntermediateTensors)
+                        hidden_states.kv_connector_output = \
+                            kv_connector_output
+                        self.kv_connector_output = kv_connector_output
+                        return hidden_states
+
+                    if self.is_pooling_model:
+                        return self._pool(
+                            hidden_states,
+                            num_scheduled_tokens,
+                            num_scheduled_tokens_np,
+                            kv_connector_output,
+                        )
+
+                    sample_hidden_states = hidden_states[logits_indices]
+                    logits = self.model.compute_logits(
+                        sample_hidden_states)
+                else:
+                    assert not self.is_pooling_model
+
+                    sample_hidden_states = hidden_states[logits_indices]
+                    if not get_pp_group().is_last_rank:
+                        all_gather_tensors = {
+                            "residual":
+                                not is_residual_scattered_for_sp(
+                                    self.vllm_config, num_tokens_padded)
+                        }
+                        get_pp_group().send_tensor_dict(
+                            hidden_states.tensors,
+                            all_gather_group=get_tp_group(),
+                            all_gather_tensors=all_gather_tensors,
+                        )
+                        logits = None
+                    else:
+                        logits = self.model.compute_logits(
+                            sample_hidden_states)
+
+                    model_output_broadcast_data: dict[str, Any] = {}
+                    if logits is not None:
+                        model_output_broadcast_data["logits"] = \
+                            logits.contiguous()
+
+                    broadcasted = get_pp_group().broadcast_tensor_dict(
+                        model_output_broadcast_data,
+                        src=len(get_pp_group().ranks) - 1,
+                    )
+                    assert broadcasted is not None
+                    logits = broadcasted["logits"]
+
+            self.execute_model_state = ExecuteModelState(
+                scheduler_output,
+                logits,
+                spec_decode_metadata,
+                spec_decode_common_attn_metadata,
+                hidden_states,
+                sample_hidden_states,
+                aux_hidden_states,
+                ec_connector_output,
+                cudagraph_stats,
+                slot_mappings,
+            )
+            self.kv_connector_output = kv_connector_output
+            return None
+
+        # Decide whether to run the forward asynchronously.  Async replay
+        # is only beneficial on the common decode path (last PP rank, not
+        # pooling, no PP broadcast) where execute_model stores state and
+        # returns None.  Early-return paths (PP intermediate, pooling) need
+        # the result immediately.
+        _use_async_replay = (
+            self._replay_thread is not None
+            and not self.is_pooling_model
+            and get_pp_group().is_last_rank
+            and not self.broadcast_pp_output
         )
-        self.kv_connector_output = kv_connector_output
 
-        # Now the batch has been launched we can wait for corrections from the
-        # previous model forward without breaking async scheduling.
-        if deferred_state_corrections_fn:
-            deferred_state_corrections_fn()
-
-        return None
+        if _use_async_replay:
+            self._replay_thread.submit_forward(_run_forward_block)
+            # Overlap: apply deferred corrections from the *previous*
+            # step while the current forward runs on the GPU.
+            if deferred_state_corrections_fn:
+                deferred_state_corrections_fn()
+            return None
+        else:
+            result = _run_forward_block()
+            if result is not None:
+                return result
+            if deferred_state_corrections_fn:
+                deferred_state_corrections_fn()
+            return None
 
     @torch.inference_mode
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        # When async graph replay is active, the background thread is
+        # still running the forward + postprocess and will populate
+        # self.execute_model_state.  Block here until it finishes.
+        if self._replay_thread is not None:
+            self._replay_thread.wait_for_result()
+
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
