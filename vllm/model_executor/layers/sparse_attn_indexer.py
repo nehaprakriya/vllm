@@ -1025,6 +1025,21 @@ class SparseAttnIndexer(CustomOp):
             # by local Triton/C++ kernels and do not require the aiter package.
             or on_gfx950()
         ):
+            # Size the MQA logits buffer to the actual batch max_seq_len rather
+            # than max_model_len (1M).  At agentx ISL p50≈108K this saves ~10x
+            # memory and reduces candidate-block kernel work proportionally.
+            # Mirrors vllm-project/vllm#56686 for the ROCm path.
+            fwd_ctx = get_forward_context()
+            attn_meta = fwd_ctx.attn_metadata
+            if isinstance(attn_meta, dict):
+                attn_meta = attn_meta.get(
+                    _encode_layer_name(self.k_cache.prefix), None
+                )
+            actual_max_seq_len = (
+                attn_meta.max_seq_len
+                if attn_meta is not None and hasattr(attn_meta, "max_seq_len")
+                else self.max_model_len
+            )
             return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
                 hidden_states,
                 _encode_layer_name(self.k_cache.prefix),
@@ -1036,7 +1051,7 @@ class SparseAttnIndexer(CustomOp):
                 self.scale_fmt,
                 self.topk_tokens,
                 self.head_dim,
-                self.max_model_len,
+                actual_max_seq_len,
                 self.max_total_seq_len,
                 self.topk_indices_buffer,
                 skip_k_cache_insert=self.skip_k_cache_insert,
