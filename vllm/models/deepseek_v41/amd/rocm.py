@@ -495,6 +495,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         # Block scale for the preshuffled weight; None = not preshuffled.
         self._wqa_wkv_scale: torch.Tensor | None = None
         self._wo_b_scale: torch.Tensor | None = None
+        self._cos_sin_cache_fp32: torch.Tensor | None = None  # for FP8 _o_proj
         self._fused_compressor_weight: torch.Tensor | None
         self.register_buffer("_fused_compressor_weight", None, persistent=False)
         self._fused_compressor_split_sizes: tuple[int, int] | None = None
@@ -535,6 +536,10 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
 
         self._wqa_wkv_scale = _prep(self.fused_wqa_wkv)
         self._wo_b_scale = _prep(self.wo_b)
+        if hasattr(self, "rotary_emb") and hasattr(self.rotary_emb, "cos_sin_cache"):
+            self._cos_sin_cache_fp32 = (
+                self.rotary_emb.cos_sin_cache.contiguous().float()
+            )
 
     def prepare_compressor_gemm_fusion(self) -> bool:
         # V4.1 derives index keys from the source compressor's emitted latent
@@ -638,7 +643,82 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
 
     def _o_proj(self, attn_out: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         o = attn_out[:, : self.n_local_heads, :]
-        # ROCm BF16 reference wo_a path (inverse RoPE + einsum) + wo_b.
+
+        # FP8 fast path: wo_a checkpoint weights are float8_e4m3fn with MX block
+        # scales (weight_block_size=[32,32], scale_fmt=ue8m0). Use them directly
+        # via fused_inv_rope_fp8_quant + batched_gemm_a8w8_mxscale (AITER CK).
+        #
+        # CUDA-graph guard: batched_gemm_a8w8_mxscale segfaults during graph
+        # capture on gfx950. The guard is intentional — captured graphs fall
+        # through to the BF16 path below, which is identical to the prior
+        # behaviour and correct for the warmup/capture phase.
+        #
+        # Lazy cos_sin cache: prepare_attn_preshuffle populates
+        # _cos_sin_cache_fp32 at model load; the guard below covers serving
+        # stacks that skip that call.
+        if self._cos_sin_cache_fp32 is None and hasattr(self, "rotary_emb") and hasattr(
+            self.rotary_emb, "cos_sin_cache"
+        ):
+            self._cos_sin_cache_fp32 = self.rotary_emb.cos_sin_cache.contiguous().float()
+
+        fp8_weight = getattr(self.wo_a, "weight", None)
+        fp8_scale = getattr(self.wo_a, "scale", None) or getattr(
+            self.wo_a, "weight_scale_inv", None
+        ) or getattr(self.wo_a, "weight_scale", None)
+        if (
+            fp8_weight is not None
+            and fp8_scale is not None
+            and fp8_weight.dtype == torch.float8_e4m3fn
+            and self._cos_sin_cache_fp32 is not None
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            try:
+                from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
+                from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
+                    fused_inv_rope_fp8_quant,
+                )
+
+                x_fp8, x_scale_fp32 = fused_inv_rope_fp8_quant(
+                    o,
+                    positions,
+                    self._cos_sin_cache_fp32,
+                    n_groups=self.n_local_groups,
+                    heads_per_group=self.n_local_heads // self.n_local_groups,
+                    nope_dim=self.nope_head_dim,
+                    rope_dim=self.rope_head_dim,
+                    quant_group_size=32,
+                    tma_aligned_scales=False,
+                )
+                log2 = x_scale_fp32.abs().clamp(min=1e-30).log2().round().clamp(-127, 127)
+                x_scale_e8m0 = (log2 + 127).to(torch.uint8)
+
+                G = self.n_local_groups
+                N = self.o_lora_rank
+                K = self.n_local_heads * self.head_dim // G
+                w_fp8 = fp8_weight.view(G, N, K)
+                if fp8_scale.dtype == torch.float8_e8m0fnu:
+                    ws_e8m0 = fp8_scale.view(torch.uint8).view(G, N // 32, K // 32)
+                elif fp8_scale.dtype == torch.float32:
+                    log2_w = fp8_scale.abs().clamp(min=1e-30).log2().round().clamp(-127, 127)
+                    ws_e8m0 = (log2_w + 127).to(torch.uint8).view(G, N // 32, K // 32)
+                else:
+                    ws_e8m0 = fp8_scale.to(torch.uint8).view(G, N // 32, K // 32)
+
+                z = batched_gemm_a8w8_mxscale(
+                    x_fp8, w_fp8, x_scale_e8m0, ws_e8m0, dtype=torch.bfloat16
+                )
+                zf = z.flatten(1)
+                if self._wo_b_scale is not None and zf.dim() == 2:
+                    return self._bpre_attn_gemm(self.wo_b.weight, self._wo_b_scale, zf, True)
+                return self.wo_b(zf)
+            except Exception as _e:
+                logger.warning_once(
+                    "[ROCm] FP8 o_proj failed (%s), using BF16 fallback: %s",
+                    type(_e).__name__,
+                    _e,
+                )
+
+        # BF16 fallback: used during CUDA graph capture and when FP8 path is unavailable.
         z = rocm_inv_rope_einsum(
             self.rotary_emb,
             o,
