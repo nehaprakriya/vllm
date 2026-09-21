@@ -56,11 +56,34 @@ def _get_aiter_sparse_prefill_opus() -> Callable[..., torch.Tensor] | None:
     return pa_sparse_prefill_opus
 
 
-_GFX950_C4A_AITER_MAX_COMPRESSED_SEQ_LEN = 64 * 1024
-_GFX950_C4A_NATIVE_MAX_ROWS = 256
 # Conservative perf gate, not a correctness bound: OPUS is correct for any query
 # count, but Triton stays faster below this measured crossover.
 _GFX950_AITER_SPARSE_PREFILL_OPUS_MIN_QUERIES = 1024
+
+# Two-dimensional routing policy for the gfx950 decode Top-K path.
+# Calibrated on MI350X (gfx950), image nightly-eed1f3d0c6, Top-K 512,
+# logits width 524288. Method: graph-captured weakest-of-5, 200-iter warmup,
+# bitwise index-set correctness verified before timing accepted.
+#
+# Context sweep at C32 (192 rows, logits_width=524288, k=512):
+#   live_ctx   native(µs)  AITER(µs)  faster
+#      8 192     39.94      19.20     AITER  (2.08×)
+#     32 768     90.29      24.21     AITER  (3.73×)
+#     65 536     93.42      36.61     AITER  (2.55×)
+#    131 072    107.40      69.39     AITER  (1.55×)
+#    262 144    129.96     120.27     AITER  (1.08×)
+#    524 288    181.48     223.88     native
+#
+# Policy table: (min_rows, max_live_compressed_ctx).
+# Use AITER when num_rows >= min_rows AND max_valid_seq_len <= max_live_ctx.
+# Entries checked in descending row order; first match wins.
+# At CUDAGraphMode.FULL, max_valid_seq_len = max_model_len (~1M), which
+# exceeds all max_ctx entries — native is chosen conservatively.
+_GFX950_C4A_TOPK_AITER_POLICY: tuple[tuple[int, int], ...] = (
+    (192, 262_144),  # C32 DSpark verify: 192 rows, typical AgentX context
+    ( 96, 131_072),  # C16 verify
+    ( 48,  65_536),  # C8 verify
+)
 
 
 def _get_aiter_top_k_kernel(
@@ -76,13 +99,17 @@ def _get_aiter_top_k_kernel(
 
     if not is_prefill:
         assert max_valid_seq_len is not None
-        # AITER v0.1.19 decode is one-block only. This measured gfx950
-        # FP32/k=1024 compressed-row boundary is independent of the native
-        # split-count boundary in sampler.cu.
-        if (
-            num_rows <= _GFX950_C4A_NATIVE_MAX_ROWS
-            and max_valid_seq_len > _GFX950_C4A_AITER_MAX_COMPRESSED_SEQ_LEN
-        ):
+        # Two-dimensional calibrated policy. max_valid_seq_len is the live
+        # compressed length for PIECEWISE steps, or max_model_len for FULL-
+        # graph replay. At max_model_len (~1M) no policy entry matches, so
+        # native is chosen conservatively — same outcome as before, but for
+        # the correct reason rather than the miscalibrated 64K threshold.
+        matched = False
+        for min_rows, max_ctx in _GFX950_C4A_TOPK_AITER_POLICY:
+            if num_rows >= min_rows and max_valid_seq_len <= max_ctx:
+                matched = True
+                break
+        if not matched:
             return None
 
     topk_ops = _get_aiter_topk_ops()
